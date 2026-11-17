@@ -1,0 +1,50 @@
+# 로컬 전용 데모: 실행 명령과 전용 비밀번호/JWT 키 생성 방법은 README 참고.
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: gatherit
+      MYSQL_USER: gatherit
+      MYSQL_PASSWORD: ${DEMO_DB_PASSWORD:?Set a local DEMO_DB_PASSWORD}
+      MYSQL_RANDOM_ROOT_PASSWORD: "yes"
+    # DB는 Compose 네트워크에만 두고 호스트에는 공개하지 않습니다.
+    volumes:
+      - gatherit-mysql:/var/lib/mysql
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          MYSQL_PWD="$$MYSQL_PASSWORD" mysql --protocol=TCP --host=127.0.0.1
+          --ssl-mode=REQUIRED --user="$$MYSQL_USER" --database="$$MYSQL_DATABASE"
+          --batch --skip-column-names --execute='SELECT 1' >/dev/null
+      interval: 5s
+      timeout: 5s
+      start_period: 20s
+      retries: 20
+
+  app:
+    build: .
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      DB_HOST: mysql
+      DB_USERNAME: gatherit
+      DB_PASSWORD: ${DEMO_DB_PASSWORD:?Set a local DEMO_DB_PASSWORD}
+      JWT_SECRET: ${DEMO_JWT_SECRET:?Set a local DEMO_JWT_SECRET}
+    # Compose의 필수값 검사에 더해, 새 데모 JWT 키의 UTF-8 바이트 길이도 확인합니다.
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        key_bytes=$$(printf '%s' "$$JWT_SECRET" | wc -c)
+        if [ "$$key_bytes" -lt 32 ]; then
+          printf '%s\n' 'DEMO_JWT_SECRET must be at least 32 bytes.' >&2
+          exit 1
+        fi
+        exec java -jar /app/app.jar
+    ports:
+      - "127.0.0.1:${DEMO_API_PORT:-8080}:8080"
+
+volumes:
+  gatherit-mysql:

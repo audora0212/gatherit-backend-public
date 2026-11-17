@@ -1,0 +1,58 @@
+### Gradle
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+!**/src/main/**/build/
+!**/src/test/**/build/
+
+### IntelliJ
+.idea/
+*.iws
+*.iml
+*.ipr
+out/
+!**/src/main/**/out/
+!**/src/test/**/out/
+
+### VSCode
+.vscode/
+
+### macOS
+.DS_Store
+
+### Spring Boot
+HELP.md
+.attach_pid*
+
+### Logs
+*.log
+logs/
+
+### Python deployment tools
+__pycache__/
+
+### Local env / secrets
+.env
+.env.*
+*.env
+application-local.yml
+secrets/
+.secrets/
+*.pem
+*.p8
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.ppk
+*firebase-adminsdk*.json
+*service-account*.json
+*service_account*.json
+.security-audit/
+*.hprof
+
+### OS
+Thumbs.db
+
+### Photo uploads (local dev)
+uploads/

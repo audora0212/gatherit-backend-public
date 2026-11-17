@@ -1,0 +1,104 @@
+plugins {
+    id 'java'
+}
+
+repositories { mavenCentral() }
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+tasks.withType(JavaCompile).configureEach {
+    options.release = 17
+    options.encoding = 'UTF-8'
+}
+
+configurations {
+    legacyRuntime
+    candidateRuntime
+    coordinatorRuntime
+    compileClasspath.extendsFrom candidateRuntime, coordinatorRuntime
+}
+
+dependencies {
+    // Independent configurations deliberately avoid the application's Boot 4
+    // dependency-management rules rewriting the actual legacy ORM/JDBC versions.
+    legacyRuntime enforcedPlatform('org.springframework.boot:spring-boot-dependencies:3.3.5')
+    candidateRuntime platform('org.springframework.boot:spring-boot-dependencies:4.1.2')
+    ['legacyRuntime', 'candidateRuntime'].each { family ->
+        add(family, 'org.hibernate.orm:hibernate-core')
+        add(family, 'org.springframework.data:spring-data-jpa')
+        add(family, 'org.springframework:spring-aspects')
+        add(family, 'org.springframework:spring-web') // Actual ErrorCode/JWT validation uses HttpStatus.
+        add(family, 'org.springframework.security:spring-security-crypto')
+        add(family, 'com.mysql:mysql-connector-j')
+        add(family, 'com.h2database:h2') // Local smoke only, never evidence of MySQL compatibility.
+        add(family, 'com.fasterxml.jackson.core:jackson-databind')
+        add(family, 'com.fasterxml.jackson.datatype:jackson-datatype-jsr310')
+        add(family, 'io.jsonwebtoken:jjwt-api:0.12.6')
+        add(family, 'io.jsonwebtoken:jjwt-impl:0.12.6')
+        add(family, 'io.jsonwebtoken:jjwt-jackson:0.12.6')
+    }
+    candidateRuntime 'com.fasterxml.jackson.core:jackson-databind:2.21.8'
+    candidateRuntime 'com.fasterxml.jackson.datatype:jackson-datatype-jsr310:2.21.8'
+    candidateRuntime('com.h2database:h2') {
+        version { strictly '2.2.224' }
+        because 'Use one file format in local smoke; real compatibility proof uses MySQL 8.4.9 only.'
+    }
+    coordinatorRuntime 'org.testcontainers:testcontainers-mysql:2.0.5'
+    coordinatorRuntime 'org.slf4j:slf4j-simple:2.0.17'
+}
+
+def appRoot = file('../..').canonicalFile
+def appClasses = new File(appRoot, 'build/classes/java/main')
+sourceSets.main.compileClasspath += files(appClasses)
+
+tasks.named('compileJava') {
+    doFirst {
+        if (!new File(appClasses, 'com/gatherit/api/event/entity/Event.class').isFile()) {
+            throw new GradleException('Build application classes first: ./gradlew classes')
+        }
+    }
+}
+
+def currentJava = {
+    def home = System.getenv('JAVA_HOME') ?: System.getProperty('java.home')
+    new File(home, "bin/java${System.getProperty('os.name').startsWith('Windows') ? '.exe' : ''}")
+}
+def runnerClasspath = { config ->
+    files(sourceSets.main.output, appClasses, config).asPath
+}
+
+tasks.register('runCompatibility', JavaExec) {
+    dependsOn classes
+    group = 'verification'
+    description = 'CI-only isolated MySQL 8.4.9 cross-version schema/data/session compatibility.'
+    executable = currentJava()
+    classpath = files(sourceSets.main.output, appClasses, configurations.candidateRuntime,
+            configurations.coordinatorRuntime)
+    mainClass = 'compat.CompatibilityCoordinator'
+    args file('schema/reference-structure.sql').absolutePath,
+            layout.buildDirectory.dir('reports').get().asFile.absolutePath
+    doFirst {
+        def zone = System.getenv('DB_COMPAT_JVM_TIMEZONE') ?: 'UTC'
+        if (!(zone in ['UTC', 'Asia/Seoul'])) throw new GradleException('Unsupported compatibility JVM timezone')
+        systemProperty 'user.timezone', zone
+        systemProperty 'compat.legacy.classpath', runnerClasspath(configurations.legacyRuntime)
+        systemProperty 'compat.candidate.classpath', runnerClasspath(configurations.candidateRuntime)
+    }
+}
+
+tasks.register('runH2Smoke', JavaExec) {
+    dependsOn classes
+    group = 'verification'
+    description = 'No-Docker local compilation/fixture smoke; explicitly NOT a MySQL proof.'
+    executable = currentJava()
+    classpath = files(sourceSets.main.output, appClasses, configurations.candidateRuntime,
+            configurations.coordinatorRuntime)
+    mainClass = 'compat.H2Smoke'
+    args layout.buildDirectory.dir('smoke').get().asFile.absolutePath
+    doFirst {
+        systemProperty 'compat.legacy.classpath', runnerClasspath(configurations.legacyRuntime)
+        systemProperty 'compat.candidate.classpath', runnerClasspath(configurations.candidateRuntime)
+    }
+}

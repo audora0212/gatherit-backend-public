@@ -1,0 +1,382 @@
+buildscript {
+    repositories { mavenCentral() }
+    dependencies {
+        // Build tooling only: make the vulnerable plugin transitive dependency explicit and updatable.
+        // Keep the Boot plugin/BOM unchanged; the application runtime already uses this patched version.
+        classpath 'org.apache.commons:commons-lang3:3.20.0'
+    }
+}
+
+plugins {
+    id 'java'
+    id 'org.springframework.boot' version '4.1.2'
+    id 'io.spring.dependency-management' version '1.1.7'
+    id 'jacoco'
+}
+
+group = 'com.gatherit'
+version = '0.0.1-SNAPSHOT'
+description = 'gatherit API — 그룹 캘린더 + 시간 투표 + 사진 공유'
+
+// Build plugin safety guard BEGIN (also executed in isolated positive/negative fixtures).
+def verifyBuildPluginDependencies = tasks.register('verifyBuildPluginDependencies') {
+    group = 'verification'
+    description = 'Verify the resolved and actually loaded build-plugin Commons Lang security patch.'
+    doLast {
+        def patched = { String version ->
+            def parts = version == null ? [] : version.tokenize('.')
+            parts.size() == 3 && parts.every { it ==~ /[0-9]+/ } &&
+                    (parts[0].toInteger() > 3 ||
+                     (parts[0].toInteger() == 3 && parts[1].toInteger() >= 18))
+        }
+        def selected = project.buildscript.configurations.classpath.resolvedConfiguration.resolvedArtifacts
+                .findAll { it.moduleVersion.id.group == 'org.apache.commons' && it.name == 'commons-lang3' }
+                .collect { it.moduleVersion.id.version }.toSet()
+        if (selected.isEmpty() || !selected.every { patched(it) }) {
+            throw new GradleException('Build-plugin commons-lang3 must resolve to a patched version (>=3.18.0)')
+        }
+        def plugin = project.plugins.getPlugin('org.springframework.boot')
+        def type = Class.forName('org.apache.commons.lang3.StringUtils', false, plugin.class.classLoader)
+        def loaded = type.package.implementationVersion
+        if (!patched(loaded) || !selected.contains(loaded)) {
+            throw new GradleException('Boot plugin classloader must load the selected patched commons-lang3')
+        }
+        def archive = new File(type.protectionDomain.codeSource.location.toURI()).name
+        if (!(archive ==~ /(?:instrumented-)?commons-lang3-${java.util.regex.Pattern.quote(loaded)}\.jar/)) {
+            throw new GradleException('Unexpected build-plugin Commons Lang code source')
+        }
+        logger.lifecycle("Build-plugin commons-lang3: resolved=${selected.join(',')}, loaded=${loaded}, archive=${archive}")
+    }
+}
+tasks.named('check') { dependsOn verifyBuildPluginDependencies }
+// Build plugin safety guard END
+
+// Use the supported Boot BOM for Framework/Security/Tomcat/Hibernate/metrics.
+// Its official Jackson 2 migration adapter preserves existing HTTP/JWT contracts;
+// Jackson 3 migration is a separate change, not an unsupported Spring override.
+ext['jackson-2-bom.version'] = '2.21.8'
+
+// Artifact safety guard BEGIN (also exercised verbatim by the offline fixture test).
+// Filter archives, not processResources: bootRun keeps resolving the developer's
+// local profile from its existing runtime classpath. Git ignore rules do not
+// control what Gradle puts in an executable or plain JAR.
+def forbiddenArtifactResource = { String entryName ->
+    def path = entryName.replace('\\', '/')
+    def rawParts = path.split('/') as List
+    if (path.startsWith('/') || path ==~ /^[A-Za-z]:.*$/ || rawParts.contains('..') ||
+            path.toCharArray().any { character -> ((int) character) < 32 }) {
+        return true
+    }
+    def parts = rawParts.findAll { it && it != '.' }.collect { it.toLowerCase(Locale.ROOT) }
+    if (parts.isEmpty()) {
+        return false
+    }
+    def name = parts.last()
+    // This is a resource policy, not a restriction on Java package/class names.
+    if (name.endsWith('.class')) {
+        return false
+    }
+    if (parts.any { it in ['secret', 'secrets', '.secret', '.secrets', 'credentials', '.credentials'] }) {
+        return true
+    }
+    if (name == '.env' || name.startsWith('.env.') || name.endsWith('.env')) {
+        return true
+    }
+    def publicLocalExamples = ['application-local.example.yml', 'application-local.example.yaml',
+                               'application-local.example.properties']
+    if (!(name in publicLocalExamples) &&
+            name ==~ /^application-local(?:[-.].+)?\.(?:yml|yaml|properties)$/) {
+        return true
+    }
+    if (name ==~ /.*\.(?:pem|key|p8|p12|pfx|jks|keystore|pkcs12|pkcs8|der|crt|cer|ppk)$/) {
+        return true
+    }
+    def credentialName = name.replace('_', '-')
+    return name.endsWith('.json') &&
+            (credentialName.contains('service-account') || credentialName.contains('serviceaccount') ||
+             credentialName.contains('firebase-adminsdk'))
+}
+
+tasks.withType(Jar).configureEach {
+    // Evaluate files rather than their parent directories so a compiled Java
+    // package named secrets is not excluded before its .class files are seen.
+    includeEmptyDirs = false
+    exclude { element -> !element.isDirectory() && forbiddenArtifactResource(element.path) }
+}
+
+def verifyArtifactSafety = tasks.register('verifyArtifactSafety') {
+    description = 'Reject local configuration and credential resource names in executable and plain JARs.'
+    group = 'verification'
+    def archiveTasks = [tasks.named('bootJar'), tasks.named('jar')]
+    dependsOn archiveTasks
+    inputs.files(archiveTasks.collect { provider -> provider.flatMap { it.archiveFile } })
+    doLast {
+        archiveTasks.each { provider ->
+            def archiveTask = provider.get()
+            if (archiveTask.enabled) {
+                new java.util.jar.JarFile(archiveTask.archiveFile.get().asFile).withCloseable { jar ->
+                    // Inspect names only; never read application configuration or nested dependencies.
+                    def forbidden = jar.entries().toList().findAll {
+                        !it.isDirectory() && forbiddenArtifactResource(it.name)
+                    }.collect { it.name }.sort()
+                    if (!forbidden.isEmpty()) {
+                        throw new GradleException("Forbidden resource names in ${archiveTask.name}: ${forbidden}")
+                    }
+                }
+            }
+        }
+    }
+}
+
+tasks.named('check') {
+    dependsOn verifyArtifactSafety
+}
+// Artifact safety guard END
+
+// Keep provenance outside Spring's build-info/git-info conventions: this is an
+// offline artifact record, not a new Actuator information contributor.
+def provenanceEntry = 'META-INF/gatherit-build.properties'
+def provenanceFile = layout.buildDirectory.file('generated/build-provenance/gatherit-build.properties')
+def provenanceVersion = version.toString()
+def provenanceProjectDir = projectDir.absolutePath
+def provenanceExec = providers
+
+def generateBuildProvenance = tasks.register('generateBuildProvenance') {
+    description = 'Record the source identity and UTC build time for the executable JAR.'
+    group = 'build'
+    outputs.file(provenanceFile)
+    // HEAD, the index and untracked files can change without Gradle input changes.
+    // Regenerate on each packaging request so neither identity nor time is stale.
+    outputs.upToDateWhen { false }
+    doLast {
+        def readGit = { List<String> arguments ->
+            try {
+                def execution = provenanceExec.exec {
+                    commandLine(['git', '-C', provenanceProjectDir] + arguments)
+                    ignoreExitValue = true
+                }
+                return execution.result.get().exitValue == 0
+                        ? execution.standardOutput.asText.get().trim() : null
+            } catch (org.gradle.process.internal.ExecException ignored) {
+                return null // Source archives and hosts without Git must say unknown.
+            }
+        }
+        // A source archive placed inside some other checkout must not inherit
+        // that unrelated checkout's identity. This service is its own repository.
+        def repositoryRoot = readGit(['rev-parse', '--show-toplevel'])
+        def ownsRepository = false
+        if (repositoryRoot != null) {
+            try {
+                // A junction, symlink or Windows virtualized path can name the
+                // same checkout differently. Compare filesystem identity, not text.
+                ownsRepository = java.nio.file.Files.isSameFile(
+                        new File(repositoryRoot).toPath(), new File(provenanceProjectDir).toPath())
+            } catch (java.io.IOException ignored) {
+                // Missing/inaccessible paths must not inherit another repository.
+            } catch (SecurityException ignored) {
+                // Keep the conservative unknown fallback.
+            }
+        }
+        def commit = ownsRepository ? readGit(['rev-parse', '--verify', 'HEAD^{commit}']) : null
+        if (commit == null || !(commit ==~ /[0-9a-f]{40}|[0-9a-f]{64}/)) {
+            commit = 'unknown'
+        }
+        def status = commit == 'unknown' ? null : readGit([
+                'status', '--porcelain=v1', '--untracked-files=normal', '--ignore-submodules=none'
+        ])
+        def metadata = new Properties()
+        metadata.setProperty('git.commit', commit)
+        metadata.setProperty('git.dirty', status == null ? 'unknown' : (!status.isEmpty()).toString())
+        metadata.setProperty('build.version', provenanceVersion)
+        metadata.setProperty('build.time', java.time.Instant.now().toString())
+        def destination = provenanceFile.get().asFile
+        destination.parentFile.mkdirs()
+        destination.withOutputStream { stream -> metadata.store(stream, null) }
+    }
+}
+
+tasks.named('bootJar') {
+    dependsOn generateBuildProvenance
+    from(provenanceFile) {
+        into 'META-INF'
+    }
+}
+
+def verifyBuildProvenance = tasks.register('verifyBuildProvenance') {
+    description = 'Verify the executable JAR contains exactly the generated provenance record.'
+    group = 'verification'
+    dependsOn tasks.named('bootJar')
+    def bootArchive = tasks.named('bootJar').flatMap { it.archiveFile }
+    inputs.file(bootArchive)
+    inputs.file(provenanceFile)
+    doLast {
+        def expected = new Properties()
+        provenanceFile.get().asFile.withInputStream { stream -> expected.load(stream) }
+        new java.util.jar.JarFile(bootArchive.get().asFile).withCloseable { jar ->
+            def entries = jar.entries().toList().findAll { it.name == provenanceEntry }
+            if (entries.size() != 1) {
+                throw new GradleException("Expected exactly one ${provenanceEntry} in bootJar")
+            }
+            def actual = new Properties()
+            jar.getInputStream(entries.first()).withCloseable { stream -> actual.load(stream) }
+            if (actual != expected || actual.stringPropertyNames() !=
+                    ['git.commit', 'git.dirty', 'build.version', 'build.time'].toSet()) {
+                throw new GradleException('Packaged build provenance does not match its generated record')
+            }
+            if (!(actual.getProperty('git.commit') ==~ /unknown|[0-9a-f]{40}|[0-9a-f]{64}/) ||
+                    !(actual.getProperty('git.dirty') in ['true', 'false', 'unknown']) ||
+                    actual.getProperty('build.version') != provenanceVersion) {
+                throw new GradleException('Invalid build provenance values')
+            }
+            java.time.Instant.parse(actual.getProperty('build.time'))
+        }
+    }
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+}
+
+configurations {
+    compileOnly {
+        extendsFrom annotationProcessor
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    constraints {
+        implementation('com.google.guava:guava:33.7.2-jre') {
+            because 'Fix CVE-2026-102554 in the transitive JWKS client dependency.'
+        }
+    }
+
+    // Spring Boot Starters
+    implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+    implementation 'org.springframework.boot:spring-boot-starter-webmvc'
+    implementation 'org.springframework.boot:spring-boot-jackson2'
+    implementation 'org.springframework.boot:spring-boot-starter-security'
+    implementation 'org.springframework.boot:spring-boot-starter-validation'
+    implementation 'org.springframework.boot:spring-boot-starter-cache'
+    implementation 'org.springframework.boot:spring-boot-starter-aspectj'
+
+    // Database
+    runtimeOnly 'com.mysql:mysql-connector-j'
+    runtimeOnly 'com.h2database:h2' // for testing
+
+    // 일부 인메모리 상태에 사용. refresh 세션은 JPA에 저장하며,
+    // 다중 인스턴스의 rate limit 등은 별도 공유 상태 설계가 필요하다.
+    implementation 'com.github.ben-manes.caffeine:caffeine:3.1.8'
+
+    // JWT 서명과 검증
+    implementation 'io.jsonwebtoken:jjwt-api:0.12.6'
+    runtimeOnly 'io.jsonwebtoken:jjwt-impl:0.12.6'
+    runtimeOnly 'io.jsonwebtoken:jjwt-jackson:0.12.6'
+
+    // Apple / Google OIDC identityToken 검증용 — JWKS 캐싱 + RSA 공개키 매칭
+    implementation 'com.auth0:jwks-rsa:0.22.1'
+    implementation 'com.auth0:java-jwt:4.4.0'
+
+    // Swagger/OpenAPI
+    implementation 'org.springdoc:springdoc-openapi-starter-webmvc-ui:3.2.0'
+
+    // S3 사진 저장
+    implementation 'software.amazon.awssdk:s3:2.20.26'
+
+    // Lombok
+    compileOnly 'org.projectlombok:lombok'
+    annotationProcessor 'org.projectlombok:lombok'
+
+    // Dev tools
+    developmentOnly 'org.springframework.boot:spring-boot-devtools'
+
+    // Monitoring
+    implementation 'org.springframework.boot:spring-boot-starter-actuator'
+    implementation 'io.micrometer:micrometer-registry-prometheus'
+
+    // Test
+    testImplementation 'org.springframework.boot:spring-boot-starter-webmvc-test'
+    testImplementation 'org.springframework.boot:spring-boot-starter-data-jpa-test'
+    testImplementation 'org.springframework.boot:spring-boot-starter-security-test'
+    testImplementation 'org.springframework.boot:spring-boot-starter-jackson-test'
+    testImplementation 'org.springframework.boot:spring-boot-starter-micrometer-metrics-test'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+
+    // 일정 가시성 쿼리 테스트용 MySQL 8 컨테이너. 다른 테스트는 Mockito/H2를 사용한다.
+    testImplementation 'org.springframework.boot:spring-boot-testcontainers'
+    testImplementation 'org.testcontainers:testcontainers-junit-jupiter'
+    testImplementation 'org.testcontainers:testcontainers-mysql'
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+    finalizedBy jacocoTestReport
+    // 테스트 실패 시 빌드도 실패 — CI 게이트가 실제 의미를 갖도록. (Docker 없는 환경의 Testcontainers
+    // 슬라이스 테스트는 @Testcontainers(disabledWithoutDocker=true) 로 '실패'가 아닌 'skip' 처리됨)
+    ignoreFailures = false
+}
+
+jacoco {
+    toolVersion = "0.8.11"
+}
+
+// 커버리지 분모에서 제외할 클래스 — report/verification 공통.
+// 외부 연동과 아래 클래스는 별도 검증 범위다. 보고된 커버리지는 전체 코드의 비율이 아니다.
+def coverageExcludes = [
+        '**/config/**',
+        '**/dto/**',
+        '**/entity/**',
+        '**/*Application.class',
+        '**/FcmService.class',
+        '**/ApnsService.class',
+        '**/ExpoPushService.class',
+        '**/GeminiExtractor.class',
+        '**/S3PhotoStorage.class',
+        '**/KakaoOAuthClient.class'
+]
+
+jacocoTestReport {
+    dependsOn test
+    reports {
+        xml.required = true
+        csv.required = false
+        html.required = true
+    }
+
+    afterEvaluate {
+        classDirectories.setFrom(files(classDirectories.files.collect {
+            fileTree(dir: it, exclude: coverageExcludes)
+        }))
+    }
+}
+
+// 커버리지 게이트 — 핵심 로직 line 커버리지가 70% 밑으로 떨어지면 빌드 실패(회귀 방지).
+// report 와 동일한 제외 목록을 사용한다. 현재 측정값은 생성된 리포트에서 확인한다.
+jacocoTestCoverageVerification {
+    dependsOn test
+    afterEvaluate {
+        classDirectories.setFrom(files(classDirectories.files.collect {
+            fileTree(dir: it, exclude: coverageExcludes)
+        }))
+    }
+    violationRules {
+        rule {
+            limit {
+                counter = 'LINE'
+                value = 'COVEREDRATIO'
+                minimum = 0.70
+            }
+        }
+    }
+}
+
+// check(=CI 의 build 가 호출)에 커버리지 게이트를 물려 회귀를 자동 차단.
+tasks.named('check') {
+    dependsOn jacocoTestCoverageVerification
+    dependsOn verifyBuildProvenance
+}

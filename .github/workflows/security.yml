@@ -1,0 +1,54 @@
+name: Dependency security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  packaged-runtime:
+    name: Packaged runtime / OSV
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Validate Gradle Wrapper
+        uses: gradle/actions/wrapper-validation@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Test inventory and scanner failure handling
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python -m unittest discover -s security -p 'test_*.py' -v
+      - name: Build and resolve packaged runtime
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon -I security/runtime-inventory.init.gradle verifyBuildPluginDependencies bootJar securityRuntimeInventory
+      - name: Check actual JAR libraries against current advisories
+        run: >-
+          python security/scan_jar.py
+          --jar build/libs/gatherit-server-0.0.1-SNAPSHOT.jar
+          --resolved build/security/resolved-runtime.json
+          --output-dir build/security
+      - name: Retain SBOM and findings, including on failure
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: packaged-runtime-security
+          path: |
+            build/security/runtime.cdx.json
+            build/security/osv-findings.json
+          if-no-files-found: warn
+          retention-days: 14

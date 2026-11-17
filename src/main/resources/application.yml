@@ -1,0 +1,151 @@
+# 기본 설정 — 모든 프로파일 공통
+# 환경별 override: application-local.yml, application-prod.yml
+spring:
+  application:
+    name: gatherit-server
+  profiles:
+    default: local
+  web:
+    error:
+      # Boot 4의 설정 경로로 이동하되 기존 개발용 오류 응답 정책은 유지한다.
+      include-message: always
+      include-binding-errors: always
+  http:
+    converters:
+      # Official Boot 4 migration adapter: keep existing Jackson 2 API contracts.
+      preferred-json-mapper: jackson2
+  jpa:
+    hibernate:
+      ddl-auto: update          # 로컬에서는 빈 DB에 스키마를 만들고 외부 DB 프로필은 validate를 사용한다.
+    properties:
+      hibernate:
+        format_sql: true
+        dialect: org.hibernate.dialect.MySQLDialect
+    open-in-view: false         # OSIV 끔 — 의도적 트랜잭션 경계 강제
+    show-sql: false
+  servlet:
+    multipart:
+      # 사진 batch — 한 번에 30장 × 10MB = 300MB. 여유 있게 350MB.
+      max-file-size: 10MB
+      max-request-size: 350MB
+  task:
+    execution:
+      pool:
+        # 외부 연동이 지연돼도 비동기 작업이 무제한 쌓이지 않게 큐 크기를 제한한다.
+        core-size: 8
+        max-size: 16
+        queue-capacity: 1000
+
+server:
+  port: 8080
+
+# JWT 서명 키와 토큰 만료 기간을 환경 변수로 설정합니다.
+# refresh-expiration: 1년 (sliding) — refresh 시마다 만료 시각 갱신.
+# 사용자가 1년 내 한 번이라도 앱 열면 무한정 유지 (다른 앱들과 동일한 "로그아웃 전까지" UX).
+jwt:
+  secret: ${JWT_SECRET}
+  expiration: 3600000             # 1h (ms) — access token
+  refresh-expiration: 31536000000 # 365d (ms) — refresh token, BE 재시작에도 DB 영속화
+  refresh-grace-ms: ${JWT_REFRESH_GRACE_MS:60000} # 응답 유실 시 직전 토큰으로 재시도할 수 있는 시간.
+
+# 상태 확인과 메트릭
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      show-details: when-authorized
+      # Preserve the existing health payload rather than adding Boot 4's new groups.
+      probes:
+        enabled: false
+  metrics:
+    tags:
+      # 메트릭에서 애플리케이션을 식별하는 공통 태그.
+      application: ${spring.application.name}
+    distribution:
+      # HTTP 요청 지연 히스토그램으로 경로별 백분위수를 계산할 수 있다.
+      percentiles-histogram:
+        http.server.requests: true
+      # 100ms~5s SLO 경계 버킷 — 느린 요청 구간 가시화.
+      slo:
+        http.server.requests: 100ms,200ms,300ms,500ms,1s,2s,5s
+
+# Springdoc OpenAPI
+springdoc:
+  api-docs:
+    path: /api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+    operations-sorter: method
+
+# S3는 선택 사항이다. 로컬 데모의 파일 저장 방식은 별도로 설정한다.
+aws:
+  s3:
+    bucket: ${AWS_S3_BUCKET:}
+    region: ${AWS_S3_REGION:us-east-1}
+    endpoint: ${AWS_S3_ENDPOINT:}      # MinIO 등 local 호환 시 채움
+    access-key: ${AWS_ACCESS_KEY:}
+    secret-key: ${AWS_SECRET_KEY:}
+    path-style: ${AWS_S3_PATH_STYLE:false}
+
+# Slack 에러 알림 — webhook URL 미설정 시 no-op
+slack:
+  webhook-url: ${SLACK_WEBHOOK_URL:}
+
+# 카카오 OAuth — client-secret 은 카카오 콘솔 [REST API 키 → 클라이언트 시크릿]
+# 연동을 사용할 때 필요한 값은 환경 변수로 지정한다.
+kakao:
+  client-id: ${KAKAO_CLIENT_ID:}
+  client-secret: ${KAKAO_CLIENT_SECRET:}
+
+# Apple Sign In — identityToken 의 audience 검증용. 앱 Bundle ID 와 일치해야 함.
+apple:
+  bundle-id: ${APPLE_BUNDLE_ID:com.audora.gatherit}
+
+# Google Sign In — idToken 의 audience 검증용.
+# Google Cloud Console 에서 발급한 OAuth client ID (iOS / Web) 콤마 구분 다중 등록.
+google:
+  client-ids: ${GOOGLE_CLIENT_IDS:}
+
+# gatherit 도메인별 설정
+gatherit:
+  public-web-base-url: ${GATHERIT_PUBLIC_WEB_BASE_URL:https://gatherit.co.kr}
+  app-deep-link-base: ${GATHERIT_APP_DEEP_LINK_BASE:gatherit://public-poll}
+  invite:
+    ttl-seconds: 604800             # 그룹 초대 토큰 7일
+  storage:
+    type: ${GATHERIT_STORAGE_TYPE:local}   # local | s3 — local 은 디스크, s3 는 AWS S3
+  photo:
+    expiry-days: 7                  # 그룹 사진 보관 일수 (TTL — cron 이 만료 row+파일 삭제)
+    expiry-batch-size: 200          # 만료 cron 1라운드 처리 수
+    local-dir: ./uploads            # local storage 디렉터리. s3 모드에선 unused.
+  rate-limit:
+    enabled: true
+
+# 앱 업데이트 안내 — 앱이 콜드스타트에서 GET /api/app/version 으로 조회 → 자기 버전과 비교.
+#  - latest 미만: 소프트 안내("나중에" 가능)
+#  - min 미만: 강제 업데이트(진행 차단, 스토어로만)
+# 버전 기본값은 로컬 데모용이다. 배포 시 앱 지원 정책을 환경 변수로 지정한다.
+app:
+  update:
+    ios:
+      latest: ${APP_IOS_LATEST:1.0.0}
+      min: ${APP_IOS_MIN:1.0.0}
+      store-url: ${APP_IOS_STORE_URL:https://apps.apple.com/app/id6767410085}
+    android:
+      latest: ${APP_ANDROID_LATEST:1.0.0}
+      min: ${APP_ANDROID_MIN:1.0.0}
+      store-url: ${APP_ANDROID_STORE_URL:https://play.google.com/store/apps/details?id=com.audora.gatherit}
+
+# AI 일정 가져오기 (v1.3) — 설계: docs/ai-schedule-import.md.
+# api-key 미설정 시 기능 비활성(503 안내). GEMINI_API_KEY 환경 변수로 설정.
+ai:
+  extractor:
+    provider: ${AI_PROVIDER:gemini}   # 현재 gemini 단일 (provider-pluggable seam)
+  gemini:
+    api-key: ${GEMINI_API_KEY:}
+    model: ${GEMINI_MODEL:gemini-2.5-flash-lite}
+  quota:
+    daily-limit: ${AI_DAILY_LIMIT:10} # 유저당 1일 추출 호출 한도(적자 방지)

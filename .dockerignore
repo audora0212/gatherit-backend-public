@@ -1,0 +1,15 @@
+# 빌드 컨텍스트 최소화 — 산출물/로컬설정/VCS 제외
+build/
+.gradle/
+.git/
+.github/
+.idea/
+*.iml
+*.log
+# 로컬 시크릿(컨테이너로 새지 않게)
+.env
+.env.*
+*.env
+secrets/
+.secrets/
+src/main/resources/application-local.yml

@@ -1,0 +1,19 @@
+# application-local.yml로 복사해 로컬 전용 DB에서만 사용합니다.
+# LOCAL_DB_PASSWORD와 JWT_SECRET은 로컬 전용 값을 환경변수로 지정합니다.
+gatherit:
+  public-web-base-url: http://127.0.0.1:3000
+  app-deep-link-base: gatherit://public-poll
+
+server:
+  address: 127.0.0.1
+
+spring:
+  datasource:
+    # MySQL 8.4의 새 기본 인증 계정은 첫 접속에서 TLS 또는 RSA 키 교환이 필요합니다.
+    url: jdbc:mysql://127.0.0.1:3306/gatherit?sslMode=REQUIRED&serverTimezone=Asia/Seoul&characterEncoding=UTF-8
+    username: gatherit
+    password: ${LOCAL_DB_PASSWORD}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+
+jwt:
+  secret: ${JWT_SECRET}

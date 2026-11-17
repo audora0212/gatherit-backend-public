@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: Build & Test (JDK 17 + MySQL Testcontainers)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Validate Gradle Wrapper
+        uses: gradle/actions/wrapper-validation@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x ./gradlew
+
+      # ubuntu-latest 러너엔 Docker 가 미리 깔려 있어 Testcontainers(MySQL 8)가 그대로 동작.
+      - name: Build & Test
+        run: ./gradlew build --no-daemon
+
+      - name: Test artifact inspection
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+          ARTIFACT_SAFETY_GRADLE: ${{ github.workspace }}/gradlew
+        run: python3 -m unittest discover -s deploy -p 'test_*.py' -v
+
+      - name: Upload JaCoCo coverage report
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: jacoco-coverage
+          path: build/reports/jacoco/test/html
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: test-results
+          path: build/reports/tests/test
+
+  compose-demo:
+    name: Docker Compose demo
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: gradle/actions/wrapper-validation@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+      - name: Start the local demo
+        run: |
+          umask 077
+          {
+            printf 'DEMO_DB_PASSWORD=%s\n' "$(openssl rand -hex 24)"
+            printf 'DEMO_JWT_SECRET=%s\n' "$(openssl rand -hex 32)"
+          } > .env.demo
+          docker compose --env-file .env.demo up --build --wait --wait-timeout 150
+      - name: Verify health, API, schema and authentication
+        run: |
+          curl -fsS http://127.0.0.1:8080/actuator/health | grep -F '"status":"UP"'
+          demo_check_dir="$(mktemp -d)"
+          trap 'rm -rf "$demo_check_dir"' EXIT
+          curl -fsS http://127.0.0.1:8080/api-docs > "$demo_check_dir/openapi.json"
+          docker compose --env-file .env.demo exec -T mysql sh -ec '
+            MYSQL_PWD="$MYSQL_PASSWORD" mysql --protocol=TCP --host=127.0.0.1 \
+              --ssl-mode=REQUIRED --user="$MYSQL_USER" --database="$MYSQL_DATABASE" \
+              --batch --skip-column-names \
+              --execute="SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()"
+          ' > "$demo_check_dir/tables.txt"
+          python3 deploy/verify-demo-contract.py "$demo_check_dir/openapi.json" "$demo_check_dir/tables.txt"
+          test "$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/api/me)" = 401
+      - name: Stop the demo
+        if: ${{ always() && hashFiles('.env.demo') != '' }}
+        run: docker compose --env-file .env.demo down --volumes
